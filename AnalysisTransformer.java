@@ -10,6 +10,8 @@ import soot.toolkits.scalar.FlowSet;
 
 
 public class AnalysisTransformer extends BodyTransformer {
+    public static final SootField ARRAY_FIELD = new SootField("[]", RefType.v("java.lang.Object"), Modifier.PUBLIC);
+
     @Override
     protected void internalTransform(Body body, String phaseName, Map<String, String> options) {
         SootMethod method = body.getMethod();
@@ -42,8 +44,8 @@ public class AnalysisTransformer extends BodyTransformer {
 
             // System.out.println();
 
-            IN.put(u, new FlowState());
-            OUT.put(u, new FlowState());
+            IN.put(u, FlowState.top());
+            OUT.put(u, FlowState.top());
             workList.offer(u);
         }
 
@@ -100,6 +102,18 @@ public class AnalysisTransformer extends BodyTransformer {
     // }
 
     private FlowState merge(FlowState s1, FlowState s2) {
+        // Top cases
+        if (s1.isTop && s2.isTop) {
+            return FlowState.top();
+        }
+        if (s1.isTop) {
+            return s2.copy();
+        }
+        if (s2.isTop) {
+            return s1.copy();
+        }
+
+        // Normal merge
         FlowState result = new FlowState();
 
         Set<Local> stackKeys = new HashSet<>();
@@ -146,9 +160,9 @@ public class AnalysisTransformer extends BodyTransformer {
             LinkedHashSet<Local> commonLocals = new LinkedHashSet<>(localsOfS1);
             commonLocals.retainAll(localsOfS2);
 
-            if (!commonLocals.isEmpty()) {
-                result.availMap.put(ofp, commonLocals);
-            }
+            // if (!commonLocals.isEmpty()) {
+            result.availMap.put(ofp, commonLocals);
+            // }
         }
 
         return result;
@@ -232,7 +246,120 @@ public class AnalysisTransformer extends BodyTransformer {
         Value lhs = stmt.getLeftOp();
         Value rhs = stmt.getRightOp();
 
-        if ((lhs instanceof Local) && (rhs instanceof AnyNewExpr)) {
+        if ((lhs instanceof Local) && (rhs instanceof NewArrayExpr)) {
+            // a = new int[n]
+            Local l = (Local) lhs;
+            String obj = "Arr_" + u.getJavaSourceStartLineNumber();
+            out.stackMap.put(l, new HashSet<>(Set.of(obj)));
+
+            killAvailability(out, l);
+
+        } else if ((lhs instanceof ArrayRef)) {
+            // a[i] = x
+            ArrayRef ar = (ArrayRef) lhs;
+            Value base = ar.getBase();
+            Value right = rhs;
+
+            if (base instanceof Local) {
+                Local baseLocal = (Local) base;
+                Set<String> baseObjs = in.stackMap.getOrDefault(baseLocal, new HashSet<>(Set.of("ANY")));
+
+                Set<String> rhsVals = new HashSet<>();
+
+                if (right instanceof Local) {
+                    Set<String> vals = in.stackMap.getOrDefault((Local) right, new HashSet<>(Set.of("ANY")));
+                    rhsVals.addAll(vals);
+                } else if (right instanceof Constant) {
+                    rhsVals.add("CONST_" + right.toString());
+                }
+                boolean strongUpdate = baseObjs.size() == 1 && !baseObjs.contains("ANY");
+
+                for (String obj : baseObjs) {
+                    if (obj.equals("ANY")) continue;
+                    ObjFieldPair ofp = new ObjFieldPair(obj, ARRAY_FIELD);
+
+                    if (strongUpdate) {
+                        out.heapMap.put(ofp, new HashSet<>(rhsVals));
+                    } else {
+                        Set<String> old = out.heapMap.getOrDefault(ofp, new HashSet<>());
+                        Set<String> updated = new HashSet<>(old);
+                        updated.addAll(rhsVals);
+                        out.heapMap.put(ofp, updated);
+                    }
+
+
+                    // if (!updated.equals(old)) {
+                    //     out.heapMap.put(ofp, updated);
+                    // }
+
+                    out.availMap.remove(ofp);
+
+                    // suppose b holds availability of some field load
+                    // then that availability should be propagated to a.f
+                    for (LinkedHashSet<Local> locals : in.availMap.values()) {
+                        if (right instanceof Local) {
+                            if (locals.contains((Local) right)) {
+                                out.availMap.put(ofp, new LinkedHashSet<>(locals));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+        } else if ((lhs instanceof Local) && (rhs instanceof ArrayRef)) {
+            // y = a[i]
+            Local l = (Local) lhs;
+            ArrayRef ar = (ArrayRef) rhs;
+            Value base = ar.getBase();
+
+            killAvailability(out, l);
+
+            if (base instanceof Local) {
+                Local baseLocal = (Local) base;
+                Set<String> baseObjs = in.stackMap.getOrDefault(baseLocal, new HashSet<>(Set.of("ANY")));
+                Set<String> result = new HashSet<>();
+
+                for (String obj : baseObjs) {
+                    if (obj.equals("ANY")) {
+                        result.add("ANY");
+                        continue;
+                    }
+
+                    ObjFieldPair ofp = new ObjFieldPair(obj, ARRAY_FIELD);
+                    Set<String> vals = out.heapMap.getOrDefault(ofp, new HashSet<>());
+                    result.addAll(vals);
+
+                    if (!result.contains("ANY") && in.availMap.containsKey(ofp)) {
+                        Set<Local> availLocals = in.availMap.get(ofp);
+                        Local firstLocal = availLocals.iterator().next();
+
+                        System.out.println(">>> REDUNDANT LOAD detected at line "
+                            + u.getJavaSourceStartLineNumber());
+                        System.out.println("    " + u.toString());
+                        System.out.println("    Replace with: "
+                            + l.getName() + " = "
+                            + firstLocal.getName());
+
+                        String className = body.getMethod().getDeclaringClass().getName();
+                        String methodName = body.getMethod().getName();
+                        int line = u.getJavaSourceStartLineNumber();
+                        String redundantString = ar.toString() + " " + firstLocal.getName();
+                        RedundancyRepository.add(className, methodName, line, redundantString);
+                    }
+
+                    out.availMap.putIfAbsent(ofp, new LinkedHashSet<>());
+                    out.availMap.get(ofp).add(l);
+                }
+                
+                Set<String> old = out.stackMap.get(l);
+                if (!result.isEmpty()) {
+                    out.stackMap.put(l, result);
+                }
+            }
+
+        
+        } else if ((lhs instanceof Local) && (rhs instanceof AnyNewExpr)) {
             // l = new ();
             Local l = (Local) lhs;
             int line = u.getJavaSourceStartLineNumber();
@@ -267,6 +394,8 @@ public class AnalysisTransformer extends BodyTransformer {
 
             Set<String> resObjs = new HashSet<>();
 
+            killAvailability(out, l);
+
             if (in.stackMap.containsKey(base)) {
                 for (String sObj : in.stackMap.getOrDefault(base, new HashSet<>(Set.of("ANY")))) {
                     if (sObj.equals("ANY")) {
@@ -277,9 +406,10 @@ public class AnalysisTransformer extends BodyTransformer {
                     ObjFieldPair ofp = new ObjFieldPair(sObj, field);
                     if (in.heapMap.containsKey(ofp)) {
                         resObjs.addAll(in.heapMap.get(ofp));
-                    } else {
-                        resObjs.add("ANY");
-                    }
+                    } 
+                    // else {
+                    //     resObjs.add("ANY");
+                    // }
 
                     if (!resObjs.contains("ANY") && in.availMap.containsKey(ofp)) {
                         Set<Local> availLocals = in.availMap.get(ofp);
@@ -371,7 +501,7 @@ public class AnalysisTransformer extends BodyTransformer {
                 out.availMap.remove(ofp);
             }
             
-        }
+        } 
         
         // the below condition will never be triggered because jimple breaks this type of stmts into 2 stmts
         // else if ((lhs instanceof InstanceFieldRef) && (rhs instanceof InstanceFieldRef)) {
@@ -437,10 +567,19 @@ class FlowState {
     Map<ObjFieldPair, Set<String>> heapMap;
     Map<ObjFieldPair, LinkedHashSet<Local>> availMap;
 
+    boolean isTop;
+
     FlowState() {
         this.stackMap = new HashMap<Local, Set<String>>();
         this.heapMap = new HashMap<ObjFieldPair, Set<String>>();
         this.availMap = new HashMap<ObjFieldPair, LinkedHashSet<Local>>();
+        this.isTop = false;
+    }
+
+    public static FlowState top() {
+        FlowState fs = new FlowState();
+        fs.isTop = true;
+        return fs;
     }
 
     FlowState copy() {
